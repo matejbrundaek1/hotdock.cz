@@ -731,3 +731,50 @@
   }
   if (doc.readyState === 'loading') doc.addEventListener('DOMContentLoaded', start); else start();
 })();
+
+
+/* Website editing: pressing F and R together (or opening the page with #admin at the end of the address)
+   opens the login. The editor itself (/hotdock.cz/_admin/editor.js) is only loaded then, so visitors download nothing extra. */
+(function () {
+  var DEMO = true;   // preview copies (GitHub Pages) switch this on: editing can be tried there, nothing is saved
+  var EDITOR = '/hotdock.cz/_admin/editor.js?v=a857bc1570', API = '/hotdock.cz/_admin/api.php';
+  var down = {}, started = false;
+  function start(open) {
+    window.KWA_DEMO = DEMO; window.KWA_API = API;
+    if (open) window.KWA_OPEN = true;
+    if (window.KWA) { if (open) window.KWA.open(); return; }
+    if (started) return;
+    started = true;
+    var s = document.createElement('script');
+    s.src = EDITOR; s.async = true;
+    document.head.appendChild(s);
+  }
+  function typing(e) {
+    var t = e.composedPath ? e.composedPath()[0] : e.target;   // the real field, also inside the editor's own windows
+    return t && t.nodeType === 1 && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
+  }
+  function which(e) {
+    var k = (e.key || '').toLowerCase();
+    return e.code === 'KeyF' || k === 'f' ? 'f' : e.code === 'KeyR' || k === 'r' ? 'r' : '';
+  }
+  addEventListener('keydown', function (e) {
+    if (e.ctrlKey || e.metaKey || e.altKey || typing(e)) return;
+    var k = which(e);
+    if (!k) return;
+    down[k] = Date.now();
+    var other = down[k === 'f' ? 'r' : 'f'];
+    if (other && down[k] - other < 1500) { down = {}; e.preventDefault(); start(true); }
+  }, true);
+  addEventListener('keyup', function (e) { var k = which(e); if (k) delete down[k]; }, true);
+  addEventListener('blur', function () { down = {}; });
+  function fromAddress() {
+    if (location.hash !== '#admin') return;
+    history.replaceState(null, '', location.pathname + location.search);
+    start(true);
+  }
+  addEventListener('hashchange', fromAddress);
+  fromAddress();
+  var on = /(?:^|;\s*)kwa=1/.test(document.cookie);
+  try { if (DEMO && sessionStorage.getItem('kwa-demo')) on = true; } catch (e) {}
+  if (on) start(false);
+})();
