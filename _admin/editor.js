@@ -23,6 +23,8 @@
   const BREAKS = /^(P|H[1-6]|LI|BLOCKQUOTE|FIGCAPTION|DD|DT|TD|TH)$/;
   const MEDIA = /assets\/img\/([^\/?#"'\s]+?)(?:-[0-9a-f]{10})?\.(?:avif|webp|jpe?g|png|gif|svg)(?:[?#]|$)/i;
   const LIMIT = 1.9 * 1024 * 1024;   // ordinary hosts accept uploads up to 2 MB
+  const NL = '\uE000';              // a line break the owner typed; api.php writes it as <br> (line ends already in the file stay)
+  const EMPTY = '\u200B';           // what an emptied text keeps (invisible), so the spot can be filled again later
 
   const st = { logged: false, token: '', undo: 0, editing: false, prepared: false, busy: false };
   let hosts = [];                    // editable pieces of text: { el, nodes:[{node,id,idx,old}], orig, els, breaks, dirty }
@@ -111,11 +113,24 @@
     // texts only screen readers get ("top of page", "use tab to navigate…") are 1 px boxes: leave them alone
     const srOnly = el => { const r = el.getBoundingClientRect(); return el.getClientRects().length > 0 && (r.width <= 2 || r.height <= 2); };
     const all = [...chosen].filter(el => !srOnly(el));
+    // existing line breaks: the k-th <br> of an element, when the page has exactly as many as the file
+    const brLists = new Map();
+    const brInfo = br => {
+      const scope = scopeOf(br);
+      if (!scope) return { id: null };
+      if (!brLists.has(scope)) {
+        const live = [...scope.getElementsByTagName('br')];
+        brLists.set(scope, live.length === srcEl(scope.id).getElementsByTagName('br').length ? live : null);
+      }
+      const list = brLists.get(scope);
+      return list ? { id: scope.id, k: list.indexOf(br), count: list.length } : { id: null };
+    };
     hosts = all.filter(el => !all.some(o => o !== el && o.contains(el))).map(el => {
       const orig = new Map();
       const w = doc.createTreeWalker(el, NodeFilter.SHOW_TEXT);
       for (let n = w.nextNode(); n; n = w.nextNode()) orig.set(n, n.data);
-      const h = { el, nodes: texts(el).map(n => ok.get(n)), orig, els: new Set(el.querySelectorAll('*')), breaks: BREAKS.test(el.nodeName), dirty: false };
+      const brs = new Map([...el.getElementsByTagName('br')].map(br => [br, brInfo(br)]));
+      const h = { el, nodes: texts(el).map(n => ok.get(n)), orig, brs, els: new Set(el.querySelectorAll('*')), breaks: BREAKS.test(el.nodeName), dirty: false };
       el.setAttribute('data-kwa-host', '');
       hostOf.set(el, h);
       return h;
@@ -145,35 +160,69 @@
   }
 
   // What a piece of text says now, put back onto the pieces it was made of in the file.
-  // Anything the browser added while typing (new pieces, line breaks) joins the piece just before it.
+  //  - words typed into an existing piece stay in that piece;
+  //  - words the browser put into a new piece join the piece before them on the same line, or else the one
+  //    after them; on a line of its own (next to an existing line break) they go right before / after that break;
+  //  - a removed existing line break is removed in the file too; Enter adds one (NL);
+  //  - a text emptied completely keeps one invisible character, so it can be filled again later.
+  // -> { texts: [...], breaks: [...], unsure } — unsure: something could not be placed exactly (shown after saving)
   function project(h) {
-    const vals = new Map(h.nodes.map(x => [x.node, null]));
-    let cur = null, pre = '', lastBr = null;
-    const put = s => { if (cur) vals.set(cur, vals.get(cur) + s); else pre += s; };
+    const seq = [];
     const w = doc.createTreeWalker(h.el, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT);
+    const mine = new Set(h.nodes.map(x => x.node));
     for (let n = w.nextNode(); n; n = w.nextNode()) {
-      lastBr = null;
       if (n.nodeType === 3) {
-        if (vals.has(n)) { vals.set(n, pre + n.data); pre = ''; cur = n; }
-        else if (h.orig.has(n)) { if (n.data !== h.orig.get(n) && !BLANK.test(n.data)) put(n.data); }
-        else put(n.data);
-      } else if (!h.els.has(n)) {
-        if (n.nodeName === 'BR') { put('\n'); lastBr = cur; }
-        else if (/^(DIV|P|LI|H[1-6])$/.test(n.nodeName) && (cur || pre)) put('\n');
-      }
+        if (mine.has(n)) seq.push({ t: 'text', n });
+        else if (h.orig.has(n)) { if (n.data !== h.orig.get(n) && !BLANK.test(n.data)) seq.push({ t: 'new', s: n.data }); }
+        else seq.push({ t: 'new', s: n.data });
+      } else if (h.brs.has(n)) seq.push({ t: 'br', n });
+      else if (!h.els.has(n) && (n.nodeName === 'BR' || (/^(DIV|P|LI|H[1-6])$/.test(n.nodeName) && seq.length))) seq.push({ t: 'new', s: NL, nl: true });
     }
-    // a browser keeps an empty line open with one extra line break at the very end
-    if (lastBr && /\n$/.test(vals.get(lastBr))) vals.set(lastBr, vals.get(lastBr).slice(0, -1));
-    if (pre) { const first = h.nodes[0].node; vals.set(first, pre + (vals.get(first) || '')); }
+    while (seq.length && seq[seq.length - 1].nl) seq.pop();   // the browser's own line break at the very end shows nothing
+    const vals = new Map(h.nodes.map(x => [x.node, '']));
+    const before = new Map();
+    const breaks = [];
+    let unsure = false;
+    for (let i = 0; i < seq.length; i++) {
+      const it = seq[i];
+      if (it.t === 'text') { vals.set(it.n, vals.get(it.n) + (before.get(it.n) || '') + it.n.data); continue; }
+      if (it.t !== 'new') continue;
+      let words = '', j = i;
+      while (j < seq.length && seq[j].t === 'new') words += seq[j++].s;
+      const prev = seq[i - 1], next = seq[j];
+      if (prev && prev.t === 'text') vals.set(prev.n, vals.get(prev.n) + words);
+      else if (next && next.t === 'text') before.set(next.n, (before.get(next.n) || '') + words);
+      else {
+        const at = next && next.t === 'br' ? { info: h.brs.get(next.n), op: 'before' } : prev && prev.t === 'br' ? { info: h.brs.get(prev.n), op: 'after' } : null;
+        if (at && at.info.id) breaks.push({ id: at.info.id, k: at.info.k, count: at.info.count, op: at.op, text: words });
+        else { unsure = true; const first = h.nodes[0].node; vals.set(first, vals.get(first) + words); }
+      }
+      i = j - 1;
+    }
+    const kept = new Set(seq.filter(x => x.t === 'br').map(x => x.n));
+    for (const [br, info] of h.brs) {
+      if (kept.has(br)) continue;
+      if (info.id) breaks.push({ id: info.id, k: info.k, count: info.count, op: 'del' });
+      else unsure = true;
+    }
+    const shown = [...vals.values(), ...breaks.map(x => x.text || '')].join('').split(NL).join('');
+    if (!shown.trim()) {
+      for (const x of h.nodes) vals.set(x.node, '');
+      vals.set(h.nodes[0].node, EMPTY);
+      for (let i = breaks.length - 1; i >= 0; i--) if (breaks[i].op !== 'del') breaks.splice(i, 1);
+    }
     const nav = !!h.el.closest('nav');   // menu items: the phone menu is found by its words (see api.php)
-    return h.nodes
-      .map(x => ({ id: x.id, idx: x.idx, old: x.old, new: vals.get(x.node) == null ? '' : vals.get(x.node), nav }))
-      .filter(c => c.new !== c.old);
+    return {
+      texts: h.nodes.map(x => ({ id: x.id, idx: x.idx, old: x.old, new: vals.get(x.node), nav })).filter(c => c.new !== c.old),
+      breaks,
+      unsure,
+    };
   }
 
   const changes = () => hosts.filter(h => h.dirty).length + photos.length;
   function check(h) {
-    h.dirty = project(h).length > 0;
+    const p = project(h);
+    h.dirty = p.texts.length + p.breaks.length > 0;
     h.el.classList.toggle('kwa-changed', h.dirty);
     refresh();
   }
@@ -220,7 +269,10 @@
     switch (r && r.error) {
       case 'net': return 'Server neodpovídá. Zkontrolujte připojení k internetu a zkuste to znovu.';
       case 'login': case 'token': return 'Přihlášení vypršelo. Přihlaste se znovu, neuložené změny zůstaly na stránce.';
-      case 'storage': case 'write': return 'Server nedovolil zapsat soubory. Na hostingu je potřeba povolit zápis do složky webu.';
+      case 'storage': return 'Server nedovolil zapsat soubory. Na hostingu je potřeba povolit zápis do složky webu.';
+      case 'write': return 'Server nedovolil zapsat soubory, web zůstal beze změny. Na hostingu je potřeba povolit zápis do složky webu.';
+      case 'write-stuck': return 'Server nedovolil zapsat soubory a některé stránky se už změnily. Až bude zápis povolený, dejte v nabídce „Vrátit poslední uložení“.';
+      case 'undo-partial': return 'Vrácení se povedlo jen zčásti, server nedovolil zapsat některé stránky. Záloha zůstala, zkuste to znovu.';
       case 'big': return 'Fotka je moc velká. Vyberte menší (do 2 MB).';
       case 'type': return 'Tenhle soubor není fotka ve formátu JPG, PNG, GIF nebo WebP.';
       case 'noapi': return 'Úpravy tady nefungují: na serveru chybí PHP nebo složka _admin.';
@@ -235,8 +287,9 @@
   // ---------- actions ----------
   async function save() {
     if (st.busy) return;
-    const list = hosts.flatMap(project);
-    if (!list.length && !photos.length) { toast('Není co uložit.', 'info'); return; }
+    const all = hosts.filter(h => h.dirty).map(project);
+    const list = all.flatMap(p => p.texts), breaks = all.flatMap(p => p.breaks), unsure = all.some(p => p.unsure);
+    if (!list.length && !breaks.length && !photos.length) { toast('Není co uložit.', 'info'); return; }
     if (DEMO) {
       toast('Tohle je jen ukázka. Na skutečném webu by se teď ' + plural(changes(), 'změna uložila', 'změny uložily', 'změn uložilo') + '.', 'info', 7000);
       return;
@@ -251,12 +304,17 @@
         if (!r.ok) throw r;
         p.url = r.url;
       }
-      const r = await call('save', { texts: list, images: photos.map(p => ({ id: p.id, media: p.media, url: p.url })) });
+      const page = location.pathname.replace(/(^|\/)(index|m)\.html$/, '').replace(/^\/+|\/+$/g, '');
+      const r = await call('save', { page, texts: list, breaks, images: photos.map(p => ({ id: p.id, media: p.media, url: p.url })) });
       if (!r.ok) throw r;
-      const missed = r.texts.filter(n => !n).length + r.images.filter(n => !n).length;
+      const missed = [...r.texts, ...r.breaks, ...r.images].filter(n => !n).length;
       remember(missed
         ? ['warn', 'Uloženo, ale ' + plural(missed, 'změnu', 'změny', 'změn') + ' se nepodařilo zapsat (text se mezitím na webu změnil). Zkontrolujte stránku a upravte ho znovu.']
-        : ['ok', 'Uloženo. Změny jsou na webu.']);
+        : r.partial
+          ? ['warn', 'Uloženo, ale ' + plural(r.partial, 'změna se nepropsala', 'změny se nepropsaly', 'změn se nepropsalo') + ' do druhé verze této stránky (pro telefon nebo pro počítač), protože je tam text trochu jinak. Tam ho upravte zvlášť: na telefonu otevřete stránku s #admin na konci adresy.']
+          : unsure
+            ? ['warn', 'Uloženo. Některé nové řádky se nedaly umístit přesně, zkontrolujte prosím, jak text vypadá.']
+            : ['ok', 'Uloženo. Změny jsou na webu.']);
       leaving = true;
       location.reload();
     } catch (r) {
@@ -389,6 +447,7 @@
       if (!h) return;
       e.stopPropagation();
       if (e.key === 'Enter') { e.preventDefault(); if (h.breaks) doc.execCommand('insertLineBreak'); return; }
+      if (e.key === ' ' && h.el.closest('button')) { e.preventDefault(); doc.execCommand('insertText', false, ' '); return; }
       if (e.key === 'Escape') { e.target.blur(); return; }
       if ((e.metaKey || e.ctrlKey) && /^[biu]$/i.test(e.key)) e.preventDefault();
     }, true);
@@ -795,6 +854,7 @@ kbd { font: 600 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace; padding: 
           done(true);
           if (st.prepared) { showDock(); setMode(true); toast('Přihlášeno.', 'ok'); }
           else begin(true, 'Přihlášeno. Klikněte do textu a pište, nebo klikněte na fotku.');
+          if (r.weak) setTimeout(() => toast('Doporučení: nastavte si vlastní delší heslo (nabídka ⋯ → Změnit heslo). Teď platí to první.', 'info', 12000), 800);
           return;
         }
         if (r.error === 'wrong') {
